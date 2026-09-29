@@ -11,7 +11,7 @@ pub struct Score {
 pub trait Engine: Send + Sync {
     fn score(&self, decision: &Decision, media: Option<&Media>) -> Result<Score, String>;
     fn props(&self) -> Result<Props, String> {
-        Err("multimodal input requires llama-server (--remote or --llama-path)".into())
+        Err("multimodal input requires llama-server (--remote-llama or --llama-path)".into())
     }
 }
 
@@ -44,18 +44,27 @@ where
         combined.push(letter);
         let joined = tokenize(&combined)?;
         combined.pop();
-        if joined.len() != tokens.len() + 1 || joined[..tokens.len()] != tokens[..] {
-            return Err(format!(
-                "answer slot {letter} is not one token at the prompt boundary"
-            ));
-        }
-        let id = joined[tokens.len()];
-        if slots.contains(&id) {
-            return Err("answer slot tokens collide".into());
-        }
-        slots.push(id);
+        slots.push(check_slot(&tokens, &joined, letter, &slots)?);
     }
     Ok((tokens, slots))
+}
+
+pub fn check_slot(
+    base: &[i32],
+    joined: &[i32],
+    letter: char,
+    previous: &[i32],
+) -> Result<i32, String> {
+    if joined.len() != base.len() + 1 || !joined.starts_with(base) {
+        return Err(format!(
+            "answer slot {letter} is not one token at the prompt boundary"
+        ));
+    }
+    let id = joined[base.len()];
+    if previous.contains(&id) {
+        return Err("answer slot tokens collide".into());
+    }
+    Ok(id)
 }
 
 pub struct Remote {

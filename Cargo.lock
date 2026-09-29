@@ -84,6 +84,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "llama-cpp-2",
+ "log",
  "serde",
  "serde_json",
  "tiny_http",

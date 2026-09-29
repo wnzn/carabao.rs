@@ -4,12 +4,14 @@ mod media;
 #[cfg(feature = "native")]
 mod native;
 mod strict_json;
+mod vllm;
 
 use backend::{Engine, Remote};
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, Parser, ValueEnum};
 use decision::{Decision, validate_state};
 use serde_json::{Value, json};
 use std::{
+    ffi::OsString,
     io::Read,
     net::TcpListener,
     path::PathBuf,
@@ -23,17 +25,64 @@ use std::{
 };
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum Verbosity {
+    Off,
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<Verbosity> for log::LevelFilter {
+    fn from(value: Verbosity) -> Self {
+        match value {
+            Verbosity::Off => Self::Off,
+            Verbosity::Error => Self::Error,
+            Verbosity::Warn => Self::Warn,
+            Verbosity::Info => Self::Info,
+            Verbosity::Debug => Self::Debug,
+            Verbosity::Trace => Self::Trace,
+        }
+    }
+}
+
+struct StderrLogger;
+static LOGGER: StderrLogger = StderrLogger;
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::max_level()
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            eprintln!("{millis} {:5} {}", record.level(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 #[derive(Parser)]
-#[command(version, about = "System One decisions on GGUF via llama.cpp", group(
-    ArgGroup::new("backend").args(["remote", "llama_path"]).multiple(false)
+#[command(version, about = "System One decisions via llama.cpp or vLLM", group(
+    ArgGroup::new("backend").args(["remote_llama", "llama_path", "remote_vllm"]).multiple(false)
 ))]
 struct Cli {
     /// Adapter listen address (loopback by default)
     #[arg(long, default_value = "127.0.0.1:8090")]
     listen: String,
-    /// Remote llama-server base URL
-    #[arg(short = 'R', long)]
-    remote: Option<String>,
+    /// Remote llama-server base URL (also -rl URL)
+    #[arg(long = "remote-llama", alias = "remote", short_alias = 'R')]
+    remote_llama: Option<String>,
+    /// Remote vLLM server root URL (also -rv URL)
+    #[arg(long = "remote-vllm", alias = "vllm-remote", short_alias = 'v')]
+    remote_vllm: Option<String>,
+    /// Model ID served by vLLM (required with -rv)
+    #[arg(long, requires = "remote_vllm")]
+    vllm_model: Option<String>,
     /// Existing llama-server executable (or directory containing it); starts a managed server
     #[arg(long)]
     llama_path: Option<PathBuf>,
@@ -76,6 +125,9 @@ struct Cli {
     /// Maximum simultaneous HTTP requests (excess requests receive 503)
     #[arg(long, default_value_t = 32)]
     max_inflight: usize,
+    /// Logging level: off, error, warn, info, debug, trace (also -lv LEVEL)
+    #[arg(long, value_enum, default_value_t = Verbosity::Info)]
+    log_verbosity: Verbosity,
 }
 
 struct App {
@@ -93,7 +145,9 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(expand_cli_args(std::env::args_os()));
+    log::set_logger(&LOGGER).map_err(|e| e.to_string())?;
+    log::set_max_level(cli.log_verbosity.into());
     if cli.initial_top_probs == 0 || cli.max_top_probs < cli.initial_top_probs {
         return Err("invalid top-probs range".into());
     }
@@ -125,7 +179,15 @@ fn run() -> Result<(), String> {
         }
     }
     let mut child = Managed(None);
-    let engine: Arc<dyn Engine> = if let Some(url) = &cli.remote {
+    let engine: Arc<dyn Engine> = if let Some(url) = &cli.remote_vllm {
+        log::info!("using vLLM backend");
+        let model = cli
+            .vllm_model
+            .as_deref()
+            .ok_or("--vllm-model is required with --remote-vllm")?;
+        Arc::new(vllm::Vllm::new(url, model)?)
+    } else if let Some(url) = &cli.remote_llama {
+        log::info!("using remote llama-server backend");
         Arc::new(Remote::new(
             url,
             cli.initial_top_probs,
@@ -133,6 +195,7 @@ fn run() -> Result<(), String> {
             cli.cache_prompt,
         )?)
     } else if let Some(llama_path) = &cli.llama_path {
+        log::info!("starting managed llama-server");
         let model = cli
             .model
             .as_ref()
@@ -216,6 +279,7 @@ fn run() -> Result<(), String> {
         }
         Arc::new(remote)
     } else {
+        log::info!("loading native GGUF backend");
         let model = cli
             .model
             .as_ref()
@@ -232,7 +296,10 @@ fn run() -> Result<(), String> {
         #[cfg(not(feature = "native"))]
         {
             let _ = model;
-            return Err("native support not compiled; use --remote or --llama-path".into());
+            return Err(
+                "native support not compiled; use --remote-llama, --remote-vllm or --llama-path"
+                    .into(),
+            );
         }
     };
     let app = Arc::new(App {
@@ -244,7 +311,7 @@ fn run() -> Result<(), String> {
         origins: cli.cors_origins,
     });
     let server = Server::http(&cli.listen).map_err(|e| format!("listen {}: {e}", cli.listen))?;
-    eprintln!("carabao listening on {}", cli.listen);
+    log::info!("carabao listening on {}", cli.listen);
     let stopping = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&stopping);
     ctrlc::set_handler(move || signal_flag.store(true, Ordering::Relaxed))
@@ -281,6 +348,36 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+// clap short options are one character. Expand only our exact two-character
+// spellings (and their =VALUE forms) before parsing; leave other args unchanged.
+fn expand_cli_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut after_separator = false;
+    args.into_iter()
+        .map(|arg| {
+            if arg == "--" {
+                after_separator = true;
+            }
+            if !after_separator {
+                for (short, long) in [
+                    ("-rl", "--remote-llama"),
+                    ("-rv", "--remote-vllm"),
+                    ("-lv", "--log-verbosity"),
+                ] {
+                    if arg == short {
+                        return OsString::from(long);
+                    }
+                    if let Some(value) = arg.to_str().and_then(|s| s.strip_prefix(short))
+                        && value.starts_with('=')
+                    {
+                        return OsString::from(format!("{long}{value}"));
+                    }
+                }
+            }
+            arg
+        })
+        .collect()
+}
+
 struct Managed(Option<Child>);
 struct Permit(mpsc::SyncSender<()>);
 impl Drop for Permit {
@@ -302,6 +399,20 @@ fn header(name: &[u8], value: &str) -> Header {
 }
 
 fn respond(request: Request, status: u16, value: Value, origin: Option<&str>) {
+    let route = if decisions_path(request.url()) {
+        "decisions"
+    } else if request.url() == "/health" {
+        "health"
+    } else {
+        "unknown"
+    };
+    if status >= 500 {
+        log::error!("{} {route}: HTTP {status}", request.method());
+    } else if status >= 400 {
+        log::warn!("{} {route}: HTTP {status}", request.method());
+    } else {
+        log::info!("{} {route}: HTTP {status}", request.method());
+    }
     let mut response = Response::from_string(value.to_string())
         .with_status_code(StatusCode(status))
         .with_header(header(b"Content-Type", "application/json"));
@@ -310,6 +421,13 @@ fn respond(request: Request, status: u16, value: Value, origin: Option<&str>) {
         response.add_header(header(b"Vary", "Origin"));
     }
     let _ = request.respond(response);
+}
+
+fn decisions_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/decisions" | "/v1/decisions" | "/systemone" | "/v1/systemone"
+    )
 }
 
 fn handle(mut request: Request, app: &App) {
@@ -331,7 +449,7 @@ fn handle(mut request: Request, app: &App) {
         return;
     }
     if let (true, Some(origin)) = (
-        request.method() == &Method::Options && request.url() == "/v1/systemone",
+        request.method() == &Method::Options && decisions_path(request.url()),
         allowed,
     ) {
         let mut response = Response::empty(StatusCode(204));
@@ -342,6 +460,7 @@ fn handle(mut request: Request, app: &App) {
             "Authorization, Content-Type",
         ));
         response.add_header(header(b"Vary", "Origin"));
+        log::info!("OPTIONS decisions: HTTP 204");
         let _ = request.respond(response);
         return;
     }
@@ -354,7 +473,7 @@ fn handle(mut request: Request, app: &App) {
         respond(request, status, json!({"status":"ok"}), allowed);
         return;
     }
-    if request.url() != "/v1/systemone" {
+    if !decisions_path(request.url()) {
         respond(
             request,
             404,
@@ -386,6 +505,7 @@ fn handle(mut request: Request, app: &App) {
         return;
     }
     let mut body = Vec::new();
+    let start = Instant::now();
     let result = request
         .as_reader()
         .take((64 << 20) + 1)
@@ -412,6 +532,10 @@ fn handle(mut request: Request, app: &App) {
             allowed,
         ),
     }
+    log::debug!(
+        "decision request completed in {} ms",
+        start.elapsed().as_millis()
+    );
 }
 
 fn evaluate(request: &Value, app: &App) -> Result<Value, (u16, String)> {
@@ -452,11 +576,20 @@ fn evaluate(request: &Value, app: &App) -> Result<Value, (u16, String)> {
     prepared.sort_by(|a, b| a.0.cmp(b.0));
     let (mut input, mut output) = (0, 0);
     let mut answers = serde_json::Map::new();
-    for (id, decision) in prepared {
+    for (index, (id, decision)) in prepared.into_iter().enumerate() {
+        let started = Instant::now();
         let score = app
             .engine
             .score(&decision, media.as_ref())
             .map_err(|s| (502, format!("questions[{id:?}]: {s}")))?;
+        log::trace!(
+            "question {} scored: options={} input_tokens={} output_tokens={} elapsed_ms={}",
+            index + 1,
+            decision.letters().count(),
+            score.input_tokens,
+            score.output_tokens,
+            started.elapsed().as_millis()
+        );
         input += score.input_tokens;
         output += score.output_tokens;
         answers.insert(
@@ -512,22 +645,95 @@ mod tests {
     }
 
     #[test]
+    fn cli_shortcuts_and_backend_conflicts() {
+        let args = expand_cli_args(
+            [
+                "carabao",
+                "-rv",
+                "http://localhost:8000",
+                "--vllm-model",
+                "test",
+                "-lv",
+                "debug",
+            ]
+            .map(OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.remote_vllm.as_deref(), Some("http://localhost:8000"));
+        assert!(matches!(cli.log_verbosity, Verbosity::Debug));
+        let equals = Cli::try_parse_from(expand_cli_args(
+            [
+                "carabao",
+                "-rv=http://localhost:8000",
+                "--vllm-model",
+                "test",
+            ]
+            .map(OsString::from),
+        ))
+        .unwrap();
+        assert_eq!(equals.remote_vllm, cli.remote_vllm);
+        let llama = Cli::try_parse_from(expand_cli_args(
+            ["carabao", "-rl=http://localhost:8080"].map(OsString::from),
+        ))
+        .unwrap();
+        assert_eq!(llama.remote_llama.as_deref(), Some("http://localhost:8080"));
+        let long_llama =
+            Cli::try_parse_from(["carabao", "--remote-llama", "http://localhost:8080"]).unwrap();
+        assert_eq!(llama.remote_llama, long_llama.remote_llama);
+        let levels = Cli::try_parse_from(expand_cli_args(
+            ["carabao", "-lv=trace"].map(OsString::from),
+        ))
+        .unwrap();
+        assert!(matches!(levels.log_verbosity, Verbosity::Trace));
+        let conflict = Cli::try_parse_from(expand_cli_args(
+            [
+                "carabao",
+                "-rl",
+                "http://localhost:8080",
+                "-rv",
+                "http://localhost:8000",
+            ]
+            .map(OsString::from),
+        ));
+        assert!(conflict.is_err());
+        let old_llama = Cli::try_parse_from(["carabao", "-R", "http://localhost:8080"]).unwrap();
+        assert_eq!(
+            old_llama.remote_llama.as_deref(),
+            Some("http://localhost:8080")
+        );
+        let old_vllm =
+            Cli::try_parse_from(["carabao", "--vllm-remote", "http://localhost:8000"]).unwrap();
+        assert_eq!(
+            old_vllm.remote_vllm.as_deref(),
+            Some("http://localhost:8000")
+        );
+        assert!(Cli::try_parse_from(["carabao", "-v", "http://localhost:8000"]).is_ok());
+        assert!(Cli::try_parse_from(["carabao", "--remote", "http://localhost:8080"]).is_ok());
+        let escaped = expand_cli_args(["carabao", "--", "-lv"].map(OsString::from));
+        assert_eq!(escaped[2], "-lv");
+        let help = Cli::try_parse_from(["carabao", "--help"]).err().unwrap();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("--remote-vllm"));
+        assert!(help.to_string().contains("--remote-llama"));
+    }
+
+    #[test]
     fn http_auth_and_cors() {
         let server = Server::http("127.0.0.1:0").unwrap();
         let address = server.server_addr().to_string();
         let worker = std::thread::spawn(move || {
             let app = app();
-            for request in server.incoming_requests().take(4) {
+            for request in server.incoming_requests().take(11) {
                 handle(request, &app);
             }
         });
-        let send = |method: &str, origin: &str, auth: &str| {
+        let send = |method: &str, path: &str, origin: &str, auth: &str| {
             let mut stream = TcpStream::connect(&address).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             let body = r#"{"model":"jev-latest","state":"hello","questions":{"q":{"type":"noul","instructions":"Is this text?"}}}"#;
-            write!(stream, "{method} /v1/systemone HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n{origin}{auth}\r\n{body}", body.len()).unwrap();
+            write!(stream, "{method} {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n{origin}{auth}\r\n{body}", body.len()).unwrap();
             let mut reply = String::new();
             stream.read_to_string(&mut reply).unwrap();
             reply
@@ -540,26 +746,46 @@ mod tests {
                 .parse::<u16>()
                 .unwrap()
         };
-        assert_eq!(code(&send("POST", "", "")), 401);
+        assert_eq!(code(&send("POST", "/decisions", "", "")), 401);
         assert_eq!(
             code(&send(
                 "POST",
+                "/decisions",
                 "Origin: http://evil.test\r\n",
                 "Authorization: Bearer secret\r\n"
             )),
             403
         );
-        let preflight = send("OPTIONS", "Origin: http://localhost:3000\r\n", "");
+        let preflight = send(
+            "OPTIONS",
+            "/decisions",
+            "Origin: http://localhost:3000\r\n",
+            "",
+        );
         assert_eq!(code(&preflight), 204);
         assert!(
             preflight
                 .to_ascii_lowercase()
                 .contains("access-control-allow-origin: http://localhost:3000")
         );
+        for path in ["/decisions", "/v1/decisions", "/systemone", "/v1/systemone"] {
+            assert_eq!(
+                code(&send("POST", path, "", "Authorization: Bearer secret\r\n")),
+                200
+            );
+        }
         assert_eq!(
-            code(&send("POST", "", "Authorization: Bearer secret\r\n")),
-            200
+            code(&send(
+                "OPTIONS",
+                "/v1/systemone",
+                "Origin: http://localhost:3000\r\n",
+                ""
+            )),
+            204
         );
+        assert_eq!(code(&send("GET", "/health", "", "")), 200);
+        assert_eq!(code(&send("GET", "/decisions", "", "")), 405);
+        assert_eq!(code(&send("GET", "/missing", "", "")), 404);
         worker.join().unwrap();
     }
 }

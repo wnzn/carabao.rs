@@ -1,9 +1,9 @@
 <div align="center">
   <h1>🐃 carabao.rs</h1>
   <p><strong>One token. Typed decisions. Your GGUF.</strong></p>
-  <p>A small Rust System One adapter for <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>.<br>
+  <p>A small Rust System One adapter for <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> and <a href="https://github.com/vllm-project/vllm">vLLM</a>.<br>
   Ask runtime-defined questions; get conditional option probabilities instead of generated prose.</p>
-  <p><code>native GGUF</code> · <code>existing llama-server</code> · <code>managed llama-server</code> · <code>choice / noul / score</code></p>
+  <p><code>native GGUF</code> · <code>llama-server</code> · <code>vLLM</code> · <code>choice / noul / score</code></p>
 </div>
 
 ---
@@ -17,19 +17,25 @@ cargo build --release
 ./target/release/carabao --model /path/to/model.gguf --ctx-size 4096
 ```
 
-Alternatively, connect to an already running llama-server or let carabao launch your installed one:
+Alternatively, connect to an already running llama-server or vLLM, or let carabao launch your installed llama-server:
 
 ```sh
-# Existing server: no model file needed on the adapter host
+# Existing llama-server: -rl is short for --remote-llama; no local model needed
 cargo build --release --no-default-features
-./target/release/carabao -R http://127.0.0.1:8080 --model-name my-model
+./target/release/carabao -rl http://127.0.0.1:8080 --model-name my-model
 
 # Existing llama.cpp installation: carabao manages llama-server
 ./target/release/carabao --llama-path /path/to/llama.cpp/build/bin \
   --model /path/to/model.gguf --gpu-layers 99 --ctx-size 8192
+
+# Existing vLLM server: use its served model ID; -rv is short for --remote-vllm
+./target/release/carabao -rv http://127.0.0.1:8000 \
+  --vllm-model Qwen/Qwen3-0.6B --model-name qwen3
 ```
 
-`--llama-path` accepts either the `llama-server` executable or its directory. Add `--mmproj /path/to/mmproj.gguf` for supported multimodal checkpoints. It binds the managed server to `127.0.0.1:8080` by default (`--llama-listen` to change). **Use `--remote` rather than `--llama-path` if a server is already running on that port.** The managed child is stopped on SIGINT/SIGTERM; SIGKILL cannot be intercepted, so check for orphaned server processes after a forced kill.
+For vLLM, start a separately installed server with `vllm serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 8000 --generation-config vllm --logprobs-mode raw_logprobs`. The vLLM URL is the **server root**, not `/v1`. `--vllm-model` must match the served model ID; `--model-name` remains the label carabao returns to clients. Set `VLLM_API_KEY` for vLLM's upstream bearer key, separately from `CARABAO_API_KEY`. vLLM support is **text-only** for now; its multimodal chat content format cannot use llama-server's media-marker path. The backend needs a vLLM release with `logprob_token_ids` in chat completions and `return_token_ids`; incompatible servers return an error rather than a guessed answer. Some model chat templates cannot make an open assistant answer match the generation prefix; carabao rejects those instead of assigning the wrong answer-token IDs. See [vLLM's chat API](https://docs.vllm.ai/en/stable/serving/online_serving/openai_compatible_server/#chat-api) and [logprob modes](https://docs.vllm.ai/en/stable/configuration/engine_args/#--logprobs-mode). Its [GGUF support](https://docs.vllm.ai/en/stable/features/quantization/gguf/) is experimental and requires a separate plugin. The older `--vllm-remote` / `-v` options remain supported as aliases.
+
+`--remote-llama` / `-rl` and `--remote-vllm` / `-rv` are mutually exclusive. The older `--remote` / `-R` spelling for llama-server remains supported as an alias. `--llama-path` accepts either the `llama-server` executable or its directory. Add `--mmproj /path/to/mmproj.gguf` for supported multimodal checkpoints. It binds the managed server to `127.0.0.1:8080` by default (`--llama-listen` to change). **Use `--remote-llama` rather than `--llama-path` if a server is already running on that port.** The managed child is stopped on SIGINT/SIGTERM; SIGKILL cannot be intercepted, so check for orphaned server processes after a forced kill.
 
 Native GPU builds are opt-in:
 
@@ -46,7 +52,7 @@ If `bindgen` cannot locate libclang, set `LIBCLANG_PATH` to its library director
 ## Ask a question
 
 ```sh
-curl -sS http://127.0.0.1:8090/v1/systemone \
+curl -sS http://127.0.0.1:8090/decisions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "jev-latest",
@@ -61,7 +67,7 @@ curl -sS http://127.0.0.1:8090/v1/systemone \
   }'
 ```
 
-The response includes `model`, question-keyed `answers`, and `usage` (`input_tokens`, `output_tokens`). Native mode reports **zero** output tokens because it reads prompt logits without generating a token; server mode reports its completion probes. Choice returns the selected ID, conditional probabilities and normalized-entropy confidence. Noul returns the probability of **yes**. Score returns a probability-weighted **zero-based** level, probabilities, legend and confidence. The `jev-latest` input alias is accepted for compatibility; the response uses `--model-name` (`carabao-local` by default). This is not Jev or a calibrated Jev-compatible model.
+`POST /decisions` is the primary endpoint; `/v1/decisions` is also accepted. `/systemone` and `/v1/systemone` remain supported as legacy aliases with the same request and response shape. The response includes `model`, question-keyed `answers`, and `usage` (`input_tokens`, `output_tokens`). Native mode reports **zero** output tokens because it reads prompt logits without generating a token; llama-server reports its completion probes and vLLM reports one generated probe token. Choice returns the selected ID, conditional probabilities and normalized-entropy confidence. Noul returns the probability of **yes**. Score returns a probability-weighted **zero-based** level, probabilities, legend and confidence. The `jev-latest` input alias is accepted for compatibility; the response uses `--model-name` (`carabao-local` by default). This is not Jev or a calibrated Jev-compatible model.
 
 ### How it scores
 
@@ -72,7 +78,7 @@ state + criterion + options  →  model chat template  →  verify A…P are dis
                           →  softmax over options   →  typed answer
 ```
 
-The prompt follows [SemIf's direct-options approach](https://github.com/TheoLeeCJ/SemIf-OpenJev). Native mode reads logits directly from the bundled llama.cpp binding: no next-token generation or top-N serialization. Remote/server mode uses `/apply-template`, `/tokenize` and `/completion`, requesting **pre-sampling** logprobs and doubling `n_probs` until all answers are found or `--max-top-probs` is reached. It checks prompt-boundary tokenization (not just bare letters) and rejects truncated prompts. It reuses one native model/context across requests; native inference is serialized through one worker, while HTTP/remote requests can run concurrently. If your GGUF chat template is not supported by the native llama.cpp template API, use a recent llama-server via `-R` or `--llama-path`. Remote templates receive `enable_thinking=false`; the native template API has no equivalent template-kwargs setting, so reasoning-specific templates may need the server path.
+The prompt follows [SemIf's direct-options approach](https://github.com/TheoLeeCJ/SemIf-OpenJev). Native mode reads logits directly from the bundled llama.cpp binding: no next-token generation or top-N serialization. The llama-server backend uses `/apply-template`, `/tokenize` and `/completion`, requesting **pre-sampling** logprobs and doubling `n_probs` until all answers are found or `--max-top-probs` is reached. The vLLM backend uses `/tokenize` to check the assistant answer boundary and `/v1/chat/completions` with `logprob_token_ids` to obtain precisely the requested labels; it verifies that vLLM actually scored the same, untruncated prompt. Both server modes generate one token per scoring probe. It reuses one native model/context across requests; native inference is serialized through one worker, while HTTP/remote requests can run concurrently. If your GGUF chat template is not supported by the native llama.cpp template API, use a recent llama-server via `-rl` or `--llama-path`. Server templates receive `enable_thinking=false`; the native template API has no equivalent template-kwargs setting, so reasoning-specific templates may need a server path.
 
 **Compatibility:** `choice` takes 2–16 options (in JSON object order); `score` takes 2–10 levels; `noul` is yes/no with optional `true`/`false` rubrics. Multiple questions are scored independently. Option probabilities sum to 1 **only among the listed options**; confidence is an uncalibrated entropy statistic, not a reliability guarantee. Question IDs and option IDs may be arbitrary nonempty strings. Invalid input returns 422; inference/backend errors return 502.
 
@@ -83,19 +89,21 @@ The prompt follows [SemIf's direct-options approach](https://github.com/TheoLeeC
 | `--listen 127.0.0.1:8090` | Adapter bind address; loopback by default. |
 | `CARABAO_API_KEY` | If set, require `Authorization: Bearer <key>` on decision requests. `SEMIF_API_KEY` is a fallback. |
 | `LLAMA_API_KEY` | Bearer token sent to a protected remote llama-server (never use it as the client key). |
+| `VLLM_API_KEY` | Bearer token sent to vLLM (`--remote-vllm` / `-rv`); independent of the client key. |
+| `--log-verbosity LEVEL`, `-lv LEVEL` | stderr log level: `off`, `error`, `warn`, `info` (default), `debug`, `trace`. Logs status; request latency at `debug`, per-question token counts/timing at `trace`. Never logs prompts, media or keys. |
 | `--cors-origin https://app.example` | Allow exactly this browser origin; repeat for several. No wildcard; CORS off by default. |
 | `--model-name LABEL` | Response model label, not the GGUF loading path. |
 | `--ctx-size N`, `--gpu-layers N`, `--threads N` | Native context, GPU offload and CPU threads; context/GPU settings also passed to managed llama-server. |
 | `--llama-startup-timeout 300` | Seconds to wait for a managed llama-server to load a model. |
-| `--initial-top-probs 256`, `--max-top-probs 262144` | Remote retry range; unused by native logits. |
+| `--initial-top-probs 256`, `--max-top-probs 262144` | llama-server retry range; unused by native or vLLM. |
 | `--cache-prompt` | Opt in to llama-server prompt reuse; off by default. |
 | `--max-inflight 32` | Bound simultaneous HTTP requests; excess receive HTTP 503. Native inference remains serialized. |
 
-`GET /health` does not need a key. `OPTIONS /v1/systemone` preflight works only for configured origins and permits `POST`, `Authorization`, and `Content-Type`. CORS is **not authentication**: keep the API key enabled and put TLS/authentication at your reverse proxy if exposing the service beyond loopback. Request bodies are limited to 64 MiB; raw prompts, media and secrets are not logged.
+`GET /health` does not need a key. `OPTIONS` preflight works on all decision routes only for configured origins and permits `POST`, `Authorization`, and `Content-Type`. CORS is **not authentication**: keep the API key enabled and put TLS/authentication at your reverse proxy if exposing the service beyond loopback. vLLM's own `--api-key` [does not protect every endpoint](https://docs.vllm.ai/en/stable/serving/online_serving/openai_compatible_server/); keep its server on loopback or behind a properly configured reverse proxy. Request bodies are limited to 64 MiB; raw prompts, media and secrets are not logged.
 
-## Multimodal (server modes)
+## Multimodal (llama-server modes)
 
-`--remote` and `--llama-path` can forward text, images, audio and video to a compatible llama-server via `/props` media markers and `multimodal_data`:
+`--remote-llama` and `--llama-path` can forward text, images, audio and video to a compatible llama-server via `/props` media markers and `multimodal_data`; **`--remote-vllm` is text-only**:
 
 ```json
 {"model":"jev-latest","state":{"type":"multimodal","content":[
@@ -120,8 +128,8 @@ The comparison uses the **same mock upstream** with short-lived connections for 
 
 | Adapter | Binary | RSS | p50 | p95 |
 | --- | ---: | ---: | ---: | ---: |
-| carabao (remote-only) | 2.76 MiB | 4.6 MiB | 1.72 ms | 2.29 ms |
-| semif-go | 9.09 MiB | 16.2 MiB | 3.07 ms | 3.82 ms |
+| carabao (remote-only) | 2.88 MiB | 4.6 MiB | 1.69 ms | 2.15 ms |
+| semif-go | 9.09 MiB | 16.2 MiB | 2.95 ms | 3.58 ms |
 
 These are one run, not a hardware-independent speed claim. A stripped CPU-native release binary on this machine was **7.2 MiB** (bundled llama.cpp); the remote-only build is smaller. A local Wendi 2B Q4_K_M GGUF smoke test returned a Noul result in 0.66 s on CPU with four threads (one run, not a benchmark). The ROCm feature compiled with this machine's HIP toolchain; GPU execution has not been measured. To compare real inference, use the same GGUF, llama.cpp backend, hardware, context size and prompt; the native/server paths may differ in template handling. The Go baseline is the existing `semif-go` binary from this workspace; no Go source files were modified.
 

@@ -68,14 +68,14 @@ def wait_ready(url, process):
     raise RuntimeError("adapter did not start")
 
 
-def measure(command, port, payload, count):
+def measure(command, port, payload, count, endpoint):
     url = f"http://127.0.0.1:{port}"
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         wait_ready(url, process)
         times = []
         for i in range(count + 10):
-            request = urllib.request.Request(url + "/v1/systemone", payload, {"Content-Type": "application/json"})
+            request = urllib.request.Request(url + endpoint, payload, {"Content-Type": "application/json"})
             start = time.perf_counter_ns()
             try:
                 with urllib.request.urlopen(request, timeout=5) as reply:
@@ -116,15 +116,15 @@ def main():
                 "first": "First team", "second": "Second team"}}
         }}).encode()
         commands = [
-            ("carabao", [args.rust, "--listen", "127.0.0.1:{port}", "-R", f"http://127.0.0.1:{mock.server_port}"]),
-            ("semif-go", [args.go, "-listen", "127.0.0.1:{port}", "-llama-url", f"http://127.0.0.1:{mock.server_port}"]),
+            ("carabao", [args.rust, "--listen", "127.0.0.1:{port}", "-rl", f"http://127.0.0.1:{mock.server_port}", "-lv", "warn"], "/decisions"),
+            ("semif-go", [args.go, "-listen", "127.0.0.1:{port}", "-llama-url", f"http://127.0.0.1:{mock.server_port}"], "/v1/systemone"),
         ]
         print("Adapter       binary MiB   RSS MiB   p50 ms   p95 ms")
-        for name, cmd in commands:
+        for name, cmd, endpoint in commands:
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
-            result = measure([arg.replace("{port}", str(port)) for arg in cmd], port, payload, args.requests)
+            result = measure([arg.replace("{port}", str(port)) for arg in cmd], port, payload, args.requests, endpoint)
             print(f"{name:<13} {os.path.getsize(cmd[0]) / 1048576:>10.2f} {result[2]:>9.1f} {result[0]:>8.2f} {result[1]:>8.2f}")
     finally:
         mock.shutdown()

@@ -136,7 +136,7 @@ impl Native {
 impl Engine for Native {
     fn score(&self, decision: &Decision, media: Option<&Media>) -> Result<Score, String> {
         if media.is_some() {
-            return Err("native multimodal inference is not available; use --llama-path with --mmproj or --remote".into());
+            return Err("native multimodal inference is not available; use --llama-path with --mmproj or --remote-llama".into());
         }
         let (reply, recv) = mpsc::channel();
         self.sender
